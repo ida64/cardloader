@@ -1,0 +1,31 @@
+# Build outputs
+build/
+*.o
+*.d
+*.elf
+*.bin
+*.nro
+*.nacp
+*.nso
+*.nsp
+*.ovl
+*.map
+*.lst
+
+# Staged artifacts and release snapshots
+work/
+
+# Not needed to build
+*.md
+device/kern/kern_initial_process.pristine.cpp
+device/ro/install.sh
+
+# Analysis databases
+*.i64
+*.id[0-9]
+*.nam
+*.til
+*.exdb
+
+# OS
+.DS_Store
