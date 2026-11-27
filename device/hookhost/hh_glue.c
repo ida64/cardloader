@@ -18,7 +18,10 @@ static bool g_ready;
 
 static hh_window_t *g_window;
 static hh_swap_t g_swap; /* attach/detach and FS's inserted predicate */
-static uintptr_t g_fs; /* FS image base, from the crt0 return address */
+/* FS image base from the crt0 return address, plus where this FS build has
+ * its code and its bss objects. Zero until the build is identified. */
+static uintptr_t g_fs_code;
+static uintptr_t g_fs_bss;
 
 /* Window ABI shared with the sysmodule. device/xci/source/xci_main.cpp
  * asserts the same offsets, so a header change that is not rebuilt into both
@@ -77,10 +80,16 @@ static void mount_static(void)
     }
 }
 
-/* Offsets into the FS image. KIP code is
+/* Offsets into the FS image, as in the FAT32 build of 23.5.0. KIP code is
  * 2 MiB aligned and crt0 sits at its start, so the crt0 return address gives
- * the image base. */
+ * the image base. The exFAT build has the same code and objects further on. */
 #define FS_ALIGN_MASK      0x1FFFFFu
+static const struct {
+    uint32_t code, bss;
+} FS_BUILDS[] = {
+    { 0, 0 },           /* FAT32 */
+    { 0xB200, 0x11000 } /* exFAT */
+};
 #define FS_SIGNAL_EVENT    0x1A7830u    /* nn::os::SignalEvent(EventType *) */
 #define FS_DETECTOR        0xFE9000u    /* nn.gc.DeviceDetector singleton */
 #define FS_DETECTOR_GUARD  0xFEE000u    /* its static-init guard byte */
@@ -93,18 +102,16 @@ static void mount_static(void)
  * thread or the window thread. Returns the HH_STAGE_WAKE_* reached. */
 static uint32_t wake_detector(void)
 {
-    static const uint32_t signal_event[] = {
-        0xA9BE7BFDu, 0xA9014FF4u, 0x910003FDu, 0xAA0003F3u, 0x91007000u,
-    };
-    uintptr_t fs = __atomic_load_n(&g_fs, __ATOMIC_ACQUIRE);
-    if (fs == 0 || memcmp((const void *)(fs + FS_SIGNAL_EVENT), signal_event, sizeof(signal_event)) != 0)
+    uintptr_t code = __atomic_load_n(&g_fs_code, __ATOMIC_ACQUIRE);
+    uintptr_t bss = __atomic_load_n(&g_fs_bss, __ATOMIC_ACQUIRE);
+    if (code == 0)
         return HH_STAGE_WAKE_NO_FS;
-    if (!(*(const uint8_t *)(fs + FS_DETECTOR_GUARD) & 1))
+    if (!(*(const uint8_t *)(bss + FS_DETECTOR_GUARD) & 1))
         return HH_STAGE_WAKE_NO_DETECTOR;
-    uint8_t *event = (uint8_t *)(fs + FS_DETECTOR + FS_DETECTOR_RESCAN);
+    uint8_t *event = (uint8_t *)(bss + FS_DETECTOR + FS_DETECTOR_RESCAN);
     if (event[FS_EVENT_STATE] != 1)
         return HH_STAGE_WAKE_NO_EVENT;
-    ((void (*)(void *))(fs + FS_SIGNAL_EVENT))(event);
+    ((void (*)(void *))(code + FS_SIGNAL_EVENT))(event);
     return HH_STAGE_WAKE_SENT;
 }
 
@@ -239,7 +246,7 @@ static void ensure_ready(void)
 
 static void finish_read(uint8_t *frame, size_t len, size_t logical)
 {
-    uintptr_t fs = __atomic_load_n(&g_fs, __ATOMIC_ACQUIRE);
+    uintptr_t fs = __atomic_load_n(&g_fs_bss, __ATOMIC_ACQUIRE);
     if (fs == 0)
         return;
     const uint8_t *link = (const uint8_t *)(fs + FS_GC_LINK);
@@ -320,6 +327,17 @@ uint32_t hh_presence_c(void *self)
 void hh_entry_c(uintptr_t lr)
 {
     hh_init();
-    g_fs = lr & ~(uintptr_t)FS_ALIGN_MASK;
+    static const uint32_t signal_event[] = {
+        0xA9BE7BFDu, 0xA9014FF4u, 0x910003FDu, 0xAA0003F3u, 0x91007000u,
+    };
+    uintptr_t base = lr & ~(uintptr_t)FS_ALIGN_MASK;
+    for (size_t i = 0; i < sizeof(FS_BUILDS) / sizeof(FS_BUILDS[0]); i++) {
+        uintptr_t code = base + FS_BUILDS[i].code;
+        if (memcmp((const void *)(code + FS_SIGNAL_EVENT), signal_event, sizeof(signal_event)) == 0) {
+            g_fs_bss = base + FS_BUILDS[i].bss;
+            g_fs_code = code;
+            break;
+        }
+    }
     hh_window_start(window_ready, window_poll);
 }

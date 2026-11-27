@@ -2,7 +2,7 @@
 
 CardLoader lets the Nintendo Switch load XCI game images from the SD card.
 
-Target: FS 23.5.0 on Atmosphère 1.12.2 (commit `3e8915011`).
+Target: FS 23.5.0 (FAT32 and exFAT builds) on Atmosphère 1.12.2 (commit `3e8915011`).
 
 ## Host build and tests
 

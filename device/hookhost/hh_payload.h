@@ -10,4 +10,4 @@
 #define HH_OFF_EXEC_TRAMP       0x0u
 #define HH_OFF_PRESENCE_TRAMP   0x18u
 #define HH_OFF_ENTRY_TRAMP      0x2cu
-#define HH_OFF_RUNTIME          0xd750u
+#define HH_OFF_RUNTIME          0xd760u

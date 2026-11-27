@@ -53,12 +53,21 @@ namespace ams::kern {
         constexpr u64 HookPresenceOffset = HH_OFF_PRESENCE_TRAMP;
         constexpr u64 HookEntryOffset    = HH_OFF_ENTRY_TRAMP;
         constexpr size_t HookRuntimeOffset = HH_OFF_RUNTIME - HH_PAYLOAD_DATA_VA;
+        /* FS 23.5.0. The exFAT build has the same code 0xB200 further on. */
         constexpr u32 HookSiteExecutor   = 0x18C3B0;
         constexpr u32 HookSitePresence2  = 0x18F280; /* real inserted predicate */
         constexpr u32 HookSiteInitData   = 0x187A1C;
         constexpr u32 HookSiteCardCert   = 0x187B30; /* BL sub_18FDC0: card certificate RSA verify */
+        constexpr u32 HookSiteShifts[]   = { 0, 0xB200 };
+        constexpr struct { u32 offset; u32 insn; } HookSites[] = {
+            { HookSiteExecutor,  0xD10403FFu }, /* SUB SP, SP, #0x100 */
+            { HookSitePresence2, 0xA9BF7BFDu }, /* STP X29, X30, [SP, #-0x10]! */
+            { HookSiteInitData,  0x9400265Du }, /* BL */
+            { HookSiteCardCert,  0x940020A4u }, /* BL */
+        };
 
-        void HookWriteToPageGroup(KPageGroup &pg, size_t offset, const void *src, size_t size) {
+        /* Out of line: the kernel image has to keep its size (tools/splice_mesosphere.py). */
+        NOINLINE void HookWriteToPageGroup(KPageGroup &pg, size_t offset, const void *src, size_t size) {
             const u8 *s = static_cast<const u8 *>(src);
             size_t pos = 0;
             for (const auto &block : pg) {
@@ -69,6 +78,22 @@ namespace ams::kern {
                     const size_t end   = std::min(block_size, offset + size - pos);
                     u8 *dst = static_cast<u8 *>(GetVoidPointer(KMemoryLayout::GetLinearVirtualAddress(block.GetAddress())));
                     std::memcpy(dst + start, s + (pos + start - offset), end - start);
+                }
+                pos = block_end;
+            }
+        }
+
+        NOINLINE void HookReadFromPageGroup(const KPageGroup &pg, size_t offset, void *dst, size_t size) {
+            u8 *d = static_cast<u8 *>(dst);
+            size_t pos = 0;
+            for (const auto &block : pg) {
+                const size_t block_size = block.GetSize();
+                const size_t block_end  = pos + block_size;
+                if (offset < block_end && offset + size > pos) {
+                    const size_t start = (offset > pos) ? (offset - pos) : 0;
+                    const size_t end   = std::min(block_size, offset + size - pos);
+                    const u8 *src = static_cast<const u8 *>(GetVoidPointer(KMemoryLayout::GetLinearVirtualAddress(block.GetAddress())));
+                    std::memcpy(d + (pos + start - offset), src + start, end - start);
                 }
                 pos = block_end;
             }
@@ -188,9 +213,10 @@ namespace ams::kern {
 
                 /* Horizon places randomized heap/alias/stack regions directly after
                  * FS's code. Use the unused MapHuge gap before the code instead. */
-                const bool hook_fs = (params.program_id == HookFsProgramId);
-                MESOSPHERE_ABORT_UNLESS(!hook_fs || params.code_address >= HookMapSize);
-                const KProcessAddress hook_va = hook_fs ? util::AlignDown(params.code_address - HookMapSize, PageSize) : params.code_address;
+                const bool is_fs = (params.program_id == HookFsProgramId);
+                bool hook_fs = false;
+                MESOSPHERE_ABORT_UNLESS(!is_fs || params.code_address >= HookMapSize);
+                const KProcessAddress hook_va = is_fs ? util::AlignDown(params.code_address - HookMapSize, PageSize) : params.code_address;
                 const u64 hook_base = GetInteger(hook_va);
 
                 /* Create the process. */
@@ -278,22 +304,38 @@ namespace ams::kern {
                         pg.Close();
                     }
 
-                    /* Patch the FS KIP text with detours to the hook host. */
-                    if (hook_fs) {
-                        u8 detour[16];
-                        HookEncodeDetour(detour, hook_base + HookExecOffset);
-                        HookWriteToPageGroup(*process_pg, HookSiteExecutor, detour, sizeof(detour));
-                        HookEncodeDetour(detour, hook_base + HookPresenceOffset);
-                        HookWriteToPageGroup(*process_pg, HookSitePresence2, detour, sizeof(detour));
-                        const u32 mov_w0_0 = 0x52800000u; /* MOV W0, #0 */
-                        HookWriteToPageGroup(*process_pg, HookSiteInitData, std::addressof(mov_w0_0), sizeof(mov_w0_0));
-                        HookWriteToPageGroup(*process_pg, HookSiteCardCert, std::addressof(mov_w0_0), sizeof(mov_w0_0));
+                    /* Patch the FS KIP text with detours to the hook host. An FS
+                     * build whose sites are not recognised boots unhooked. */
+                    if (is_fs) {
+                        for (const u32 shift : HookSiteShifts) {
+                            bool match = true;
+                            for (const auto &site : HookSites) {
+                                u32 insn = 0;
+                                HookReadFromPageGroup(*process_pg, site.offset + shift, std::addressof(insn), sizeof(insn));
+                                match = match && insn == site.insn;
+                            }
+                            if (!match) {
+                                continue;
+                            }
 
-                        /* Initialize the hook host from crt0 in place of the bss memset. */
-                        const u64 crt0_site = params.code_address + 0x30;
-                        const s64 delta = static_cast<s64>(hook_base + HookEntryOffset) - static_cast<s64>(crt0_site);
-                        const u32 bl = 0x94000000u | (static_cast<u32>(delta >> 2) & 0x3FFFFFFu);
-                        HookWriteToPageGroup(*process_pg, 0x30, std::addressof(bl), sizeof(bl));
+                            u8 detour[16];
+                            HookEncodeDetour(detour, hook_base + HookExecOffset);
+                            HookWriteToPageGroup(*process_pg, HookSiteExecutor + shift, detour, sizeof(detour));
+                            HookEncodeDetour(detour, hook_base + HookPresenceOffset);
+                            HookWriteToPageGroup(*process_pg, HookSitePresence2 + shift, detour, sizeof(detour));
+                            const u32 mov_w0_0 = 0x52800000u; /* MOV W0, #0 */
+                            HookWriteToPageGroup(*process_pg, HookSiteInitData + shift, std::addressof(mov_w0_0), sizeof(mov_w0_0));
+                            HookWriteToPageGroup(*process_pg, HookSiteCardCert + shift, std::addressof(mov_w0_0), sizeof(mov_w0_0));
+
+                            /* Initialize the hook host from crt0 in place of the bss memset. */
+                            const u64 crt0_site = params.code_address + 0x30;
+                            const s64 delta = static_cast<s64>(hook_base + HookEntryOffset) - static_cast<s64>(crt0_site);
+                            const u32 bl = 0x94000000u | (static_cast<u32>(delta >> 2) & 0x3FFFFFFu);
+                            HookWriteToPageGroup(*process_pg, 0x30, std::addressof(bl), sizeof(bl));
+
+                            hook_fs = true;
+                            break;
+                        }
                     }
 
                     /* Initialize the process. */
