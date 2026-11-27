@@ -17,6 +17,7 @@ work/
 
 # Not needed to build
 *.md
+!README.md
 device/kern/kern_initial_process.pristine.cpp
 device/ro/install.sh
 
